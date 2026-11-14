@@ -267,7 +267,7 @@ static const char * const matrix_coeffs_names[] = {
  */
 static u32 double_write_mode = 0x2000;
 static bool p3i_live_borders;
-static bool p3i_fel_borders;
+static bool p3i_fel_borders = true;
 static bool p3i_frame_l5_capable = true;
 
 static DEFINE_SPINLOCK(p3i_border_lock);
@@ -16447,7 +16447,7 @@ MODULE_PARM_DESC(double_write_mode, "\n double_write_mode\n");
 
 module_param(p3i_live_borders, bool, 0644);
 module_param(p3i_fel_borders, bool, 0644);
-MODULE_PARM_DESC(p3i_fel_borders, "Enable the experimental G12B Dolby Vision FEL base-layer border tap");
+MODULE_PARM_DESC(p3i_fel_borders, "Enable the G12B Dolby Vision FEL base-layer tap for subtitle borders (default: on)");
 module_param(p3i_frame_l5_capable, bool, 0444);
 MODULE_PARM_DESC(p3i_live_borders, "Opt in to G12B HEVC live border detection on decoder open");
 module_param_cb(p3i_active_area, &p3i_active_area_ops, NULL, 0444);
