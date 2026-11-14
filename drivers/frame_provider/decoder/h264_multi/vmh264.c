@@ -23,6 +23,7 @@
 #include <linux/kfifo.h>
 #include <linux/platform_device.h>
 #include <linux/random.h>
+#include <linux/amlogic/cpu_version.h>
 
 #include <linux/amlogic/media/utils/amstream.h>
 #include <linux/amlogic/media/frame_sync/ptsserv.h>
@@ -345,6 +346,23 @@ static unsigned int mb_count_threshold = 5; /*percentage*/
 */
 static u32 double_write_mode;
 static u32 without_display_mode;
+
+static DEFINE_SPINLOCK(p3i_h264_lock);
+struct p3i_h264_sample {
+	unsigned long stamp;
+	unsigned int sequence, width, height, peak;
+	unsigned int border[4];
+	bool valid;
+};
+
+struct p3i_h264_session {
+	unsigned int token, epoch, resets;
+	unsigned long next;
+	char status;
+	struct p3i_h264_sample sample;
+};
+static struct p3i_h264_session p3i_h264_sessions[MAX_INSTANCE_MUN];
+static unsigned int p3i_h264_epoch;
 
 static int loop_playback_poc_threshold = 400;
 static int poc_threshold = 50;
@@ -889,6 +907,7 @@ struct vdec_h264_hw_s {
 #endif
 	u32 no_mem_count;
 	u32 canvas_mode;
+	unsigned int p3i_border_token;
 	bool is_used_v4l;
 	void *v4l2_ctx;
 	bool v4l_params_parsed;
@@ -2916,6 +2935,244 @@ static int post_prepare_process(struct vdec_s *vdec, struct FrameStore *frame)
 	return 0;
 }
 
+static u8 p3i_h264_y(const u8 *luma, unsigned int stride,
+		     unsigned int x, unsigned int y)
+{
+	/* On G12B the tiled canvas reverses bytes in each 64-bit word. */
+	x ^= 7;
+	return luma[(y & ~31U) * stride + (x & ~31U) * 32 +
+		    (y & 31) * 32 + (x & 31)];
+}
+
+static int p3i_h264_edge(const u8 *luma, unsigned int width, unsigned int height,
+			 unsigned int stride, unsigned int side)
+{
+	unsigned int depth = side < 2 ? height : width;
+	unsigned int length = side < 2 ? width : height;
+	unsigned int inset, i;
+
+	for (inset = 0; inset <= depth / 3; inset++) {
+		unsigned int depth_pos = side & 1 ? depth - 1 - inset : inset;
+		unsigned int lit = 0;
+
+		for (i = 1; i <= 16; i++) {
+			unsigned int pos = length / 4 + (length / 2) * i / 17;
+			unsigned int x = side < 2 ? pos : depth_pos;
+			unsigned int y = side < 2 ? depth_pos : pos;
+
+			if (p3i_h264_y(luma, stride, x, y) > 22 && ++lit > 1)
+				return inset;
+		}
+	}
+	return -1;
+}
+
+static struct p3i_h264_session *p3i_h264_session(struct vdec_h264_hw_s *hw)
+{
+	unsigned int id = hw_to_vdec(hw)->id;
+
+	if (!hw->p3i_border_token || id >= ARRAY_SIZE(p3i_h264_sessions))
+		return NULL;
+	return &p3i_h264_sessions[id];
+}
+
+/* Called under p3i_h264_lock; zero is reserved for unowned rows. */
+static unsigned int p3i_h264_next_epoch(void)
+{
+	if (!++p3i_h264_epoch)
+		++p3i_h264_epoch;
+	return p3i_h264_epoch;
+}
+
+static void p3i_h264_register(struct vdec_h264_hw_s *hw)
+{
+	struct p3i_h264_session *session = p3i_h264_session(hw);
+	unsigned long flags;
+
+	if (!session)
+		return;
+	spin_lock_irqsave(&p3i_h264_lock, flags);
+	*session = (struct p3i_h264_session) {
+		.token = hw->p3i_border_token,
+		.epoch = p3i_h264_next_epoch(),
+		.status = 'P',
+	};
+	spin_unlock_irqrestore(&p3i_h264_lock, flags);
+}
+
+/* A buffer-manager flush can queue old pictures. Suppress samples throughout
+ * the flush, including when parameter changes nest a reconfiguration.
+ */
+static void p3i_h264_reset(struct vdec_h264_hw_s *hw, bool begin)
+{
+	struct p3i_h264_session *session = p3i_h264_session(hw);
+	unsigned long flags;
+
+	if (!session)
+		return;
+	spin_lock_irqsave(&p3i_h264_lock, flags);
+	if (session->token == hw->p3i_border_token) {
+		if (begin) {
+			session->resets++;
+			session->epoch = p3i_h264_next_epoch();
+			session->status = 'P';
+			session->sample.valid = false;
+			session->next = 0;
+		} else {
+			session->resets--;
+		}
+	}
+	spin_unlock_irqrestore(&p3i_h264_lock, flags);
+}
+
+static void p3i_h264_retire(struct vdec_h264_hw_s *hw)
+{
+	struct p3i_h264_session *session = p3i_h264_session(hw);
+	unsigned long flags;
+
+	if (!session)
+		return;
+	spin_lock_irqsave(&p3i_h264_lock, flags);
+	if (session->token == hw->p3i_border_token)
+		session->token = 0;
+	spin_unlock_irqrestore(&p3i_h264_lock, flags);
+}
+
+static bool p3i_h264_sdr(unsigned int signal)
+{
+	unsigned int primaries = (signal >> 16) & 0xff;
+	unsigned int transfer = (signal >> 8) & 0xff;
+	unsigned int matrix = signal & 0xff;
+
+	if (!(signal & VIDEO_SIGNAL_TYPE_AVAILABLE_MASK))
+		return true;
+	if (signal & BIT(25))
+		return false;
+	return !(signal & BIT(24)) ||
+		((primaries == 1 || primaries == 2) &&
+		 (transfer == 1 || transfer == 2) && (matrix == 1 || matrix == 2));
+}
+
+static void p3i_h264_measure(struct vdec_s *vdec, struct vdec_h264_hw_s *hw,
+			    const struct vframe_s *vf, int index)
+{
+	struct p3i_h264_session *session = p3i_h264_session(hw);
+	const struct buffer_spec_s *buffer = &hw->buffer_spec[index];
+	const struct canvas_config_s *canvas = &buffer->canvas_config[0];
+	const unsigned int width = vf->width, height = vf->height;
+	const unsigned int stride = canvas->width;
+	struct p3i_h264_sample sample = {
+		.stamp = jiffies, .width = width, .height = height,
+	};
+	const u8 *luma;
+	unsigned int epoch, x, y, i;
+	unsigned long flags, size;
+	char status = 'N';
+	int edge;
+
+	if (!session || in_atomic() || irqs_disabled())
+		return;
+	spin_lock_irqsave(&p3i_h264_lock, flags);
+	if (session->token != hw->p3i_border_token || session->resets ||
+	    (session->next && time_before(sample.stamp, session->next))) {
+		spin_unlock_irqrestore(&p3i_h264_lock, flags);
+		return;
+	}
+	epoch = session->epoch;
+	session->next = sample.stamp + max_t(unsigned long, 1, HZ / 8);
+	spin_unlock_irqrestore(&p3i_h264_lock, flags);
+
+	if (!is_meson_g12b_cpu() || vdec->type != VDEC_TYPE_FRAME_BLOCK ||
+	    hw->is_used_v4l || hw->enable_fence || hw->mmu_enable ||
+	    hw->double_write_mode || vdec->master || vdec->slave ||
+	    vdec_secure(vdec) ||
+	    (vf->type & VIDTYPE_TYPEMASK) != VIDTYPE_PROGRESSIVE ||
+	    !(vf->type & VIDTYPE_VIU_NV21) ||
+	    hw->dpb.frame_crop_left_offset || hw->dpb.frame_crop_top_offset ||
+	    width < 256 || width > 1920 || height < 256 || height > 1080 ||
+	    stride < width || stride > 2048 || canvas->height < height ||
+	    canvas->height > 1152 || !canvas->phy_addr ||
+	    canvas->block_mode != CANVAS_BLKMODE_32X32 ||
+	    stride % 32 || canvas->height % 32 ||
+	    !p3i_h264_sdr(hw->video_signal_from_vui))
+		goto publish;
+
+	size = stride * canvas->height;
+	if (canvas->phy_addr != buffer->y_addr || buffer->u_addr <= buffer->y_addr ||
+	    size > buffer->u_addr - buffer->y_addr)
+		goto publish;
+	luma = codec_mm_phys_to_virt(canvas->phy_addr);
+	if (!luma || !virt_addr_valid(luma))
+		goto publish;
+	status = 'Y';
+	if (vf->flag & VFRAME_FLAG_ERROR_RECOVERY)
+		goto publish;
+	codec_mm_dma_flush((void *)luma, size, DMA_FROM_DEVICE);
+	for (y = height / 4; y < 3 * height / 4; y += 32)
+		for (x = width / 4; x < 3 * width / 4; x += 32)
+			sample.peak = max_t(unsigned int, sample.peak,
+					    p3i_h264_y(luma, stride, x, y));
+	if (sample.peak < 40)
+		goto publish;
+	for (i = 0; i < ARRAY_SIZE(sample.border); i++) {
+		edge = p3i_h264_edge(luma, width, height, stride, i);
+		if (edge < 0)
+			goto publish;
+		sample.border[i] = edge;
+	}
+	/* One-sided shadows can look like bars. Require centered pairs
+	 * until asymmetric confidence is verified for this decoder. */
+	if (abs((int)sample.border[0] - (int)sample.border[1]) <= 4 &&
+	    abs((int)sample.border[2] - (int)sample.border[3]) <= 4)
+		sample.valid = true;
+publish:
+	spin_lock_irqsave(&p3i_h264_lock, flags);
+	if (session->token == hw->p3i_border_token && session->epoch == epoch &&
+	    !session->resets) {
+		/* An SPS-only visible size change need not reallocate the canvas. */
+		if (session->sample.width &&
+		    (session->sample.width != sample.width ||
+		     session->sample.height != sample.height))
+			session->epoch = p3i_h264_next_epoch();
+		sample.sequence = session->sample.sequence + 1;
+		session->sample = sample;
+		session->status = status;
+	}
+	spin_unlock_irqrestore(&p3i_h264_lock, flags);
+}
+
+static int p3i_h264_get_status(char *buf, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	unsigned int i;
+	int len = 0;
+
+	spin_lock_irqsave(&p3i_h264_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(p3i_h264_sessions); i++) {
+		const struct p3i_h264_session *session = &p3i_h264_sessions[i];
+		const struct p3i_h264_sample *s = &session->sample;
+
+		if (!session->token)
+			continue;
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%u %c %u",
+				 session->token, session->status, session->epoch);
+		if (s->valid && time_before(jiffies, s->stamp + HZ / 2))
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 " 1 %u %u %u %u %u %u %u 16 %u",
+					 s->sequence, s->width, s->height,
+					 s->border[0], s->height - 1 - s->border[1],
+					 s->border[2], s->width - 1 - s->border[3],
+					 s->peak);
+		len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	}
+	spin_unlock_irqrestore(&p3i_h264_lock, flags);
+	return len;
+}
+
+static const struct kernel_param_ops p3i_h264_status_ops = {
+	.get = p3i_h264_get_status,
+};
+
 static int post_video_frame(struct vdec_s *vdec, struct FrameStore *frame)
 {
 	struct vdec_h264_hw_s *hw = (struct vdec_h264_hw_s *)vdec->private;
@@ -3189,6 +3446,8 @@ static int post_video_frame(struct vdec_s *vdec, struct FrameStore *frame)
 			atomic_add(1, &hw->vf_get_count);
 			continue;
 		}
+		if (hw->p3i_border_token)
+			p3i_h264_measure(vdec, hw, vf, buffer_index);
 		kfifo_put(&hw->display_q, (const struct vframe_s *)vf);
 
 		ATRACE_COUNTER(hw->trace.pts_name, vf->pts);
@@ -10300,6 +10559,7 @@ static void h264_reconfig(struct vdec_h264_hw_s *hw)
 		PRINT_FLAG_DUMP_BUFSPEC))
 		dump_bufspec(hw, "pre h264_reconfig");
 
+	p3i_h264_reset(hw, true);
 	flush_dpb(p_H264_Dpb);
 	bufmgr_h264_remove_unused_frame(p_H264_Dpb, 0);
 
@@ -10362,6 +10622,7 @@ static void h264_reconfig(struct vdec_h264_hw_s *hw)
 	if (dpb_is_debug(DECODE_ID(hw),
 		PRINT_FLAG_DUMP_BUFSPEC))
 		dump_bufspec(hw, "after h264_reconfig");
+	p3i_h264_reset(hw, false);
 }
 
 #ifdef ERROR_HANDLE_TEST
@@ -10443,6 +10704,7 @@ static void h264_reset_bufmgr(struct vdec_s *vdec)
 	__func__, hw->decode_pic_count+1,
 	hw->skip_frame_count);
 
+	p3i_h264_reset(hw, true);
 	flush_dpb(&hw->dpb);
 
 	timeout = jiffies + HZ;
@@ -10484,6 +10746,7 @@ static void h264_reset_bufmgr(struct vdec_s *vdec)
 		hw->init_flag = 1;
 
 	hw->reset_bufmgr_count++;
+	p3i_h264_reset(hw, false);
 #endif
 }
 
@@ -10609,6 +10872,9 @@ static int ammvdec_h264_probe(struct platform_device *pdev)
 	}
 
 	if (pdata->config_len) {
+		if (!get_config_int(pdata->config, "p3i_border_token", &config_val) &&
+		    config_val > 0)
+			hw->p3i_border_token = config_val;
 		/*use ptr config for doubel_write_mode, etc*/
 		if (get_config_int(pdata->config,
 			"mh264_double_write_mode", &config_val) == 0)
@@ -10906,6 +11172,7 @@ static int ammvdec_h264_probe(struct platform_device *pdev)
 		vdec_timeline_create(pdata->sync, DRIVER_NAME);
 	}
 
+	p3i_h264_register(hw);
 	return 0;
 }
 
@@ -11004,6 +11271,7 @@ static int ammvdec_h264_remove(struct platform_device *pdev)
 	if (hw->enable_fence)
 		vdec_fence_release(hw, vdec->sync);
 
+	p3i_h264_retire(hw);
 	ammvdec_h264_mmu_release(hw);
 	h264_free_hw_stru(&pdev->dev, (void *)hw);
 	clk_adj_frame_count = 0;
@@ -11292,6 +11560,7 @@ MODULE_PARM_DESC(disp_vframe_valve_level, "\n disp_vframe_valve_level\n");
 module_param(double_write_mode, uint, 0664);
 MODULE_PARM_DESC(double_write_mode, "\n double_write_mode\n");
 
+module_param_cb(p3i_active_area_status, &p3i_h264_status_ops, NULL, 0444);
 module_param(mem_map_mode, uint, 0664);
 MODULE_PARM_DESC(mem_map_mode, "\n mem_map_mode\n");
 
