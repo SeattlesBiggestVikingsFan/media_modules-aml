@@ -10251,6 +10251,13 @@ static bool p3i_border_signal_supported(u32 signal)
 		(transfer == 1 || transfer == 2) && (matrix == 1 || matrix == 2);
 }
 
+static bool p3i_frame_l5_supported(const struct hevc_state_s *hevc, const struct vframe_s *vf)
+{
+	return !hevc->dv_duallayer && !vf->discard_dv_data &&
+		((vf->width == 3840 && vf->height == 2160) ||
+		 (vf->width == 1920 && vf->height == 1080));
+}
+
 static bool p3i_border_supported(const struct PIC_s *pic, const struct vframe_s *vf,
 				 unsigned int scale)
 {
@@ -10365,9 +10372,7 @@ static void p3i_measure_borders(struct hevc_state_s *hevc, struct PIC_s *pic,
 	if (!luma)
 		goto publish;
 
-	frame_supported = slot >= 0 && pic->show_frame &&
-		vf->width == 3840 && vf->height == 2160 &&
-		!hevc->dv_duallayer && !vf->discard_dv_data;
+	frame_supported = slot >= 0 && pic->show_frame && p3i_frame_l5_supported(hevc, vf);
 	codec_mm_dma_flush((void *)luma, stride * height, DMA_FROM_DEVICE);
 	for (y = height / 4; y < 3 * height / 4; y += 32)
 		for (x = width / 4; x < 3 * width / 4; x += 32)
@@ -10824,8 +10829,7 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
 		    !pic->error_mark && pic->output_ready &&
 		    !(get_dbg_flag(hevc) & H265_DEBUG_DISPLAY_CUR_FRAME))
 			p3i_border_status(hevc, p3i_border_supported(pic, vf, hevc->p3i_border_scale) &&
-				(!hevc->p3i_frame_l5 || (vf->width == 3840 && vf->height == 2160 &&
-				 !hevc->dv_duallayer && !vf->discard_dv_data)) ? 'Y' : 'N', false);
+				(!hevc->p3i_frame_l5 || p3i_frame_l5_supported(hevc, vf)) ? 'Y' : 'N', false);
 		if (hevc->p3i_border_scale && pic->double_write_mode && !display_dw)
 			p3i_measure_borders(hevc, pic, vf);
 		else
