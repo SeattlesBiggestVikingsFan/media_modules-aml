@@ -467,8 +467,6 @@ static void vdec_mpeg4_get_vf(struct vdec_mpeg4_inst *inst, struct vdec_v4l2_buf
 		return;
 	}
 
-	atomic_set(&vf->use_cnt, 1);
-
 	fb = (struct vdec_v4l2_buffer *)vf->v4l_mem_handle;
 	fb->vf_handle = (unsigned long)vf;
 	fb->status = FB_ST_DISPLAY;

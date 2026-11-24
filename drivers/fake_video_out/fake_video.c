@@ -72,20 +72,12 @@ static struct vframe_s *video_vf_get(void)
 
 	vf = vf_get(RECEIVER_NAME);
 
-	if (vf) {
-		atomic_set(&vf->use_cnt, 1);
-		/*pr_err("Get vframe  w: %d, h: %d, fence: %lx, idx: %d\n",
-			vf->width, vf->height, (ulong)vf->fence, vf->index & 0xff);*/
-	}
-
 	return vf;
 }
 
 static void video_vf_put(struct vframe_s *vf)
 {
-	struct vframe_provider_s *vfp = vf_get_provider(RECEIVER_NAME);
-
-	if (vfp && vf && atomic_dec_and_test(&vf->use_cnt)) {
+	if (vf) {
 		vf_put(vf, RECEIVER_NAME);
 	}
 }
